@@ -6,6 +6,8 @@ from flask import Flask, request, jsonify
 import azure.cognitiveservices.speech as speechsdk
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential
+from azure.ai.textanalytics import PiiEntityCategory
+
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
@@ -146,7 +148,16 @@ def analyze_text(text):
     client = get_language_client()
 
     # 1. PII first: the raw text goes to exactly one Language call
-    pii = client.recognize_pii_entities([text], language="en")[0]
+    pii = client.recognize_pii_entities(
+    [text], language="en",
+    categories_filter=[
+        PiiEntityCategory.PERSON,
+        PiiEntityCategory.PHONE_NUMBER,
+        PiiEntityCategory.EMAIL,
+        PiiEntityCategory.ADDRESS,
+        PiiEntityCategory.CREDIT_CARD_NUMBER,
+    ],
+)[0]
     if pii.is_error:
         raise RuntimeError(pii.error.message)
     redacted = pii.redacted_text
