@@ -7,3 +7,4 @@ temp_audio/
 *.mp3
 .venv/
 .venv/
+process_out.json
