@@ -1,13 +1,11 @@
-import os, uuid, subprocess, threading, json
+import os, uuid, subprocess, threading, json, base64
 from dotenv import load_dotenv
 load_dotenv()
 
 from flask import Flask, request, jsonify
 import azure.cognitiveservices.speech as speechsdk
-from azure.ai.textanalytics import TextAnalyticsClient
+from azure.ai.textanalytics import TextAnalyticsClient, PiiEntityCategory
 from azure.core.credentials import AzureKeyCredential
-from azure.ai.textanalytics import PiiEntityCategory
-
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
@@ -20,6 +18,13 @@ ESCALATION_PHRASES = [
     "cancel my account", "speak to a manager", "speak to your manager",
     "talk to a manager", "lawyer", "attorney", "sue you", "supervisor",
 ]
+PII_CATEGORIES = [
+    PiiEntityCategory.PERSON, PiiEntityCategory.PHONE_NUMBER,
+    PiiEntityCategory.EMAIL, PiiEntityCategory.ADDRESS,
+    PiiEntityCategory.CREDIT_CARD_NUMBER,
+]
+VOICES = {"jenny": "en-US-JennyNeural", "guy": "en-US-GuyNeural",
+          "aria": "en-US-AriaNeural"}
 
 
 # ---------------------------------------------------------------- Speech
@@ -96,31 +101,51 @@ def transcribe_wav(wav_path):
     }
 
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
-    f = request.files.get("audio")
-    if not f or not f.filename:
-        return jsonify({"error": "No audio file provided (field name: audio)"}), 400
+def save_and_convert(f):
+    """Save upload, convert to WAV. Returns (src, wav); caller must clean up."""
     ext = f.filename.rsplit(".", 1)[-1].lower()
-    if ext not in ALLOWED:
-        return jsonify({"error": f"Unsupported audio format: .{ext}"}), 415
-
     uid = uuid.uuid4().hex
     src = os.path.join(TMP_DIR, f"{uid}_in.{ext}")
     wav = os.path.join(TMP_DIR, f"{uid}_16k.wav")
+    f.save(src)
+    to_wav(src, wav)
+    return src, wav
+
+
+def cleanup(*paths):
+    for p in paths:
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def check_upload():
+    """Returns (file, error_response)."""
+    f = request.files.get("audio")
+    if not f or not f.filename:
+        return None, (jsonify({"error": "No audio file provided (field name: audio)"}), 400)
+    ext = f.filename.rsplit(".", 1)[-1].lower()
+    if ext not in ALLOWED:
+        return None, (jsonify({"error": f"Unsupported audio format: .{ext}"}), 415)
+    return f, None
+
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe():
+    """Internal/testing endpoint. Returns the raw transcript."""
+    f, err = check_upload()
+    if err:
+        return err
+    src = wav = None
     try:
-        f.save(src)
         try:
-            to_wav(src, wav)
+            src, wav = save_and_convert(f)
         except ValueError as e:
             return jsonify({"error": str(e)}), 415
         return jsonify(transcribe_wav(wav))
     except Exception as e:
         return jsonify({"error": "Transcription failed", "detail": str(e)}), 500
     finally:
-        for p in (src, wav):
-            if os.path.exists(p):
-                os.remove(p)
+        cleanup(*(p for p in (src, wav) if p))
 
 
 # -------------------------------------------------------------- Language
@@ -149,15 +174,7 @@ def analyze_text(text):
 
     # 1. PII first: the raw text goes to exactly one Language call
     pii = client.recognize_pii_entities(
-    [text], language="en",
-    categories_filter=[
-        PiiEntityCategory.PERSON,
-        PiiEntityCategory.PHONE_NUMBER,
-        PiiEntityCategory.EMAIL,
-        PiiEntityCategory.ADDRESS,
-        PiiEntityCategory.CREDIT_CARD_NUMBER,
-    ],
-)[0]
+        [text], language="en", categories_filter=PII_CATEGORIES)[0]
     if pii.is_error:
         raise RuntimeError(pii.error.message)
     redacted = pii.redacted_text
@@ -212,6 +229,90 @@ def analyze():
         return jsonify({"error": "Analysis failed", "detail": str(e)}), 500
 
 
+# ------------------------------------------------------------------- TTS
+
+def build_summary(analysis):
+    """Spoken summary built only from the redacted analysis."""
+    esc = analysis["escalation"]
+    parts = []
+    if esc["flagged"]:
+        parts.append("This call was flagged for escalation.")
+    else:
+        parts.append("This call was not flagged for escalation.")
+    parts.append(f"The overall tone was {analysis['sentiment']['label']}.")
+    n = analysis["pii"]["redacted_count"]
+    if n:
+        parts.append(f"{n} piece{'s' if n != 1 else ''} of personal information "
+                     f"{'were' if n != 1 else 'was'} redacted.")
+    phrases = analysis["key_phrases"][:3]
+    if phrases:
+        parts.append("Key topics were " + ", ".join(phrases) + ".")
+    return " ".join(parts)
+
+
+def synthesize(text, voice="en-US-JennyNeural"):
+    cfg = speechsdk.SpeechConfig(
+        subscription=os.environ["AZURE_SPEECH_KEY"],
+        region=os.environ["AZURE_SPEECH_REGION"],
+    )
+    cfg.speech_synthesis_voice_name = voice
+    cfg.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3)
+    synth = speechsdk.SpeechSynthesizer(speech_config=cfg, audio_config=None)
+    result = synth.speak_text_async(text).get()
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        details = speechsdk.SpeechSynthesisCancellationDetails.from_result(result)
+        raise RuntimeError(f"TTS failed: {details.error_details}")
+    return {
+        "audio_base64": base64.b64encode(result.audio_data).decode("ascii"),
+        "char_count": len(text),
+    }
+
+
+# --------------------------------------------------------------- Process
+
+@app.route("/process", methods=["POST"])
+def process():
+    f, err = check_upload()
+    if err:
+        return err
+    voice = VOICES.get(request.form.get("voice", "jenny"), VOICES["jenny"])
+    src = wav = None
+    try:
+        try:
+            src, wav = save_and_convert(f)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 415
+
+        stt = transcribe_wav(wav)                 # raw transcript stays in memory
+        if not stt["transcript"].strip():
+            return jsonify({"error": "No speech detected in audio"}), 422
+
+        analysis = analyze_text(stt["transcript"])
+        summary = build_summary(analysis)
+        tts = synthesize(summary, voice)
+
+        return jsonify({
+            "transcript": analysis["redacted_text"],   # redacted only
+            "language": stt["language"],
+            "duration_seconds": stt["duration_seconds"],
+            "confidence": stt["confidence"],
+            "sentiment": analysis["sentiment"],
+            "sentences": analysis["sentences"],
+            "key_phrases": analysis["key_phrases"],
+            "entities": analysis["entities"],
+            "pii": {"redacted_count": analysis["pii"]["redacted_count"],
+                    "categories": analysis["pii"]["categories"]},
+            "escalation": analysis["escalation"],
+            "summary_text": summary,
+            "audio_base64": tts["audio_base64"],
+        })
+    except Exception as e:
+        return jsonify({"error": "Processing failed", "detail": str(e)}), 500
+    finally:
+        cleanup(*(p for p in (src, wav) if p))
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host="127.0.0.1", port=port)
