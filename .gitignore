@@ -6,3 +6,4 @@ temp_audio/
 *.wav
 *.mp3
 .venv/
+.venv/
