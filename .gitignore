@@ -5,3 +5,4 @@ __pycache__/
 temp_audio/
 *.wav
 *.mp3
+.venv/
