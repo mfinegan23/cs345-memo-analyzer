@@ -1,4 +1,4 @@
-import os, uuid, subprocess, threading, json, base64
+import os, uuid, subprocess, threading, json, base64, wave
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,6 +28,12 @@ VOICES = {"jenny": "en-US-JennyNeural", "guy": "en-US-GuyNeural",
 
 
 # ---------------------------------------------------------------- Speech
+
+def cleanup(*paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            os.remove(p)
+
 
 def to_wav(src, dst):
     """Convert any input to 16 kHz mono 16-bit WAV with ffmpeg."""
@@ -91,7 +97,10 @@ def transcribe_wav(wav_path):
     if state["error"]:
         raise RuntimeError(state["error"])
 
-    duration = (words[-1]["offset"] + words[-1]["duration"]) if words else 0.0
+    # Billed audio length: measure the WAV, not the last word's end
+    with wave.open(wav_path, "rb") as w:
+        duration = w.getnframes() / w.getframerate()
+
     return {
         "transcript": " ".join(texts),
         "language": "en-US",
@@ -107,15 +116,13 @@ def save_and_convert(f):
     uid = uuid.uuid4().hex
     src = os.path.join(TMP_DIR, f"{uid}_in.{ext}")
     wav = os.path.join(TMP_DIR, f"{uid}_16k.wav")
-    f.save(src)
-    to_wav(src, wav)
+    try:
+        f.save(src)
+        to_wav(src, wav)
+    except Exception:
+        cleanup(src, wav)  # don't leak temp files if conversion fails
+        raise
     return src, wav
-
-
-def cleanup(*paths):
-    for p in paths:
-        if os.path.exists(p):
-            os.remove(p)
 
 
 def check_upload():
@@ -143,9 +150,9 @@ def transcribe():
             return jsonify({"error": str(e)}), 415
         return jsonify(transcribe_wav(wav))
     except Exception as e:
-        return jsonify({"error": "Transcription failed", "detail": str(e)}), 500
+        return jsonify({"error": "Transcription failed", "detail": type(e).__name__}), 500
     finally:
-        cleanup(*(p for p in (src, wav) if p))
+        cleanup(src, wav)
 
 
 # -------------------------------------------------------------- Language
@@ -157,13 +164,13 @@ def get_language_client():
     )
 
 
-def decide_escalation(overall, sentences, raw_text):
+def decide_escalation(overall, sentences, text):
     reasons = []
     if overall == "negative":
         reasons.append("overall_negative")
     if sum(1 for s in sentences if s["negative"] >= 0.80) >= 2:
         reasons.append("multiple_negative_sentences")
-    lowered = raw_text.lower()
+    lowered = text.lower()
     if any(p in lowered for p in ESCALATION_PHRASES):
         reasons.append("escalation_phrase")
     return {"flagged": bool(reasons), "reasons": reasons}
@@ -213,7 +220,7 @@ def analyze_text(text):
             "categories": sorted({i["category"] for i in pii_items}),
             "items": pii_items,
         },
-        "escalation": decide_escalation(sent.sentiment, sentences, text),
+        "escalation": decide_escalation(sent.sentiment, sentences, redacted),
     }
 
 
@@ -226,7 +233,7 @@ def analyze():
     try:
         return jsonify(analyze_text(text))
     except Exception as e:
-        return jsonify({"error": "Analysis failed", "detail": str(e)}), 500
+        return jsonify({"error": "Analysis failed", "detail": type(e).__name__}), 500
 
 
 # ------------------------------------------------------------------- TTS
@@ -244,7 +251,8 @@ def build_summary(analysis):
     if n:
         parts.append(f"{n} piece{'s' if n != 1 else ''} of personal information "
                      f"{'were' if n != 1 else 'was'} redacted.")
-    phrases = analysis["key_phrases"][:3]
+    # skip phrases containing redaction masks so TTS doesn't read "star star"
+    phrases = [p for p in analysis["key_phrases"] if "*" not in p][:3]
     if phrases:
         parts.append("Key topics were " + ", ".join(phrases) + ".")
     return " ".join(parts)
@@ -308,9 +316,9 @@ def process():
             "audio_base64": tts["audio_base64"],
         })
     except Exception as e:
-        return jsonify({"error": "Processing failed", "detail": str(e)}), 500
+        return jsonify({"error": "Processing failed", "detail": type(e).__name__}), 500
     finally:
-        cleanup(*(p for p in (src, wav) if p))
+        cleanup(src, wav)
 
 
 if __name__ == "__main__":

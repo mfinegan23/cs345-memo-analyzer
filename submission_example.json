@@ -1,0 +1,57 @@
+{
+  "audio_base64": "//NIxAAY8IX8EksGSAggBGLtBgbRDgXJgSAAERf9...[truncated]",
+  "confidence": 0.613,
+  "duration_seconds": 21.25,
+  "entities": [],
+  "escalation": {
+    "flagged": false,
+    "reasons": []
+  },
+  "key_phrases": [
+    "phone number",
+    "next payment",
+    "question",
+    "bill",
+    "mail"
+  ],
+  "language": "en-US",
+  "pii": {
+    "categories": [
+      "Email",
+      "PhoneNumber"
+    ],
+    "redacted_count": 2
+  },
+  "sentences": [
+    {
+      "label": "neutral",
+      "negative": 0.0,
+      "text": "Hi. "
+    },
+    {
+      "label": "neutral",
+      "negative": 0.0,
+      "text": "I have a question about my bill. "
+    },
+    {
+      "label": "neutral",
+      "negative": 0.0,
+      "text": "My phone number is ******** and my e-mail is *********************. "
+    },
+    {
+      "label": "neutral",
+      "negative": 0.01,
+      "text": "Could you tell me when my next payment is due?"
+    }
+  ],
+  "sentiment": {
+    "label": "neutral",
+    "scores": {
+      "negative": 0.0,
+      "neutral": 0.99,
+      "positive": 0.0
+    }
+  },
+  "summary_text": "This call was not flagged for escalation. The overall tone was neutral. 2 pieces of personal information were redacted. Key topics were phone number, next payment, question.",
+  "transcript": "Hi. I have a question about my bill. My phone number is ******** and my e-mail is *********************. Could you tell me when my next payment is due?"
+}
