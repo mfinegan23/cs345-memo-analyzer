@@ -1,0 +1,60 @@
+// ===== Customer Call Reviewer: KQL for Application Insights > Logs =====
+// Gauges export one value per interval; histograms export sum + count.
+// sum(value)/sum(n) is the correct mean for both kinds.
+
+// 1. Per-metric averages (screenshot for the report)
+customMetrics
+| where timestamp > ago(1h)
+| where name in ("stt_confidence", "stage_stt_ms", "stage_pii_ms", "stage_language_ms", "stage_tts_ms")
+| extend n = coalesce(valueCount, 1)
+| summarize avg_value = sum(value) / sum(n), min_value = min(valueMin), max_value = max(valueMax), call_count = sum(n) by name
+| order by name asc
+
+// 2. Confidence trend, one row per export interval
+customMetrics
+| where timestamp > ago(2h) and name == "stt_confidence"
+| project timestamp, confidence = value, audioFormat = tostring(customDimensions["audio_format"])
+| order by timestamp desc
+
+// 3. DOMAIN METRIC: share of calls flagged (and by reason)
+customMetrics
+| where timestamp > ago(24h) and name == "call_flagged"
+| extend n = coalesce(valueCount, 1)
+| summarize flagged = sum(value), calls = sum(n), flagged_share = sum(value) / sum(n)
+
+customMetrics
+| where timestamp > ago(24h) and name == "call_flagged"
+| extend reason = tostring(customDimensions["flag_reason"]), n = coalesce(valueCount, 1)
+| summarize calls = sum(n), flagged = sum(value) by reason
+| order by calls desc
+
+// 4. Waterfall data: average duration of each stage span
+dependencies
+| where timestamp > ago(1h) and name startswith "stage."
+| summarize avg_ms = avg(duration), p95_ms = percentile(duration, 95), n = count() by name
+| order by avg_ms desc
+
+// 5. Pipeline events (stored as attributes on the request span)
+requests
+| where timestamp > ago(2h) and name has "process"
+| project timestamp, resultCode, duration,
+          event = tostring(customDimensions["event.name"]),
+          flagged = tostring(customDimensions["call.flagged"]),
+          reason = tostring(customDimensions["call.flag_reason"]),
+          errorStage = tostring(customDimensions["error.stage"]),
+          errorType = tostring(customDimensions["error.type"])
+| order by timestamp desc
+
+// 6. PII redaction (Track 1 evidence): items redacted per call
+customMetrics
+| where timestamp > ago(24h) and name == "pii_redacted_count"
+| extend n = coalesce(valueCount, 1)
+| summarize total_items = sum(value), calls = sum(n), avg_per_call = sum(value) / sum(n)
+
+// 7. TRACK 2 COST MODEL inputs: per-call averages from your test sessions
+customMetrics
+| where timestamp > ago(7d)
+| where name in ("stt_duration_seconds", "tts_char_count", "language_text_chars")
+| extend n = coalesce(valueCount, 1)
+| summarize total = sum(value), calls = sum(n), avg_per_call = sum(value) / sum(n) by name
+// Feed avg_per_call into:  python cost_model.py --help
